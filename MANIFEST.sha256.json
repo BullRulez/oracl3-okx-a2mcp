@@ -1,14 +1,15 @@
 {
   ".env.example": "0f3ca6f29b7f4bf9ba7592b1bed95ffd4c2fd45977b1c03ae235669533845f39",
-  "DEPLOYMENT_CHECKLIST.md": "07ed21f761916b6473f79cdb044b79810ae85a2c16de91ccc3b8d3d636ab6228",
+  "DEPLOYMENT_CHECKLIST.md": "487134c1a47a030ec570edb74915f013f6db659d465948fb3124cd4560ece81e",
   "Dockerfile": "942f91009b34668186cdcd7d4f6cf9eb952bddd7d89fc2c7199d5bedf129d9f9",
-  "README.md": "ac1a9111f4a4709f76d1eda9b57c9cb7ed6a97519799f0554bd153956f273ae2",
+  "README.md": "53f1644489d5676121281740ca1524b0bfb2d485cb2daba88f24146c36ba41e9",
   "api/index.py": "506fdc6f0b591c6c47249aee0da8346ca0340777e96d1e0354bca7de2c56d5a1",
-  "app/main.py": "9b707927474cd0d0c85007bc45360117d2cef29af0f1b8099e7c304862101707",
-  "app/risk.py": "ad850af83d5d42ba44edec7eaab19f1989c07ab1eb784016381681d745b652c7",
+  "app/main.py": "53426343068bd1c74f081e266f7b29323aa5aa2bbe6956fdc62e72b8e37bd2fa",
+  "app/risk.py": "cca76fcad3f8ef5ce046fbd3096cca56ca0457debe28bc10755b58acf881094b",
+  "requirements-dev.txt": "0e7d800c45d87cda68e95d462890ae6a7a006b839af6247af7dc55d25aa725dc",
   "requirements.txt": "e2d9db7bf12617c61e041a823d834a0ed6078aa617beeeed9bce39d9138706cb",
-  "scripts/selfcheck.sh": "a8dbeeb92e7bed010eebd9bef48d40e3715c641da244c03d8663be5c1cf6ad54",
-  "tests/test_app.py": "6aa44bd2af9eb4d0a9f97b5fb591bba2e4a582a781621b7d1e5dd4955efa636f",
-  "tests/test_risk.py": "0b6546e4f785a395264b1fe079d474b01528b5e65122151ea6baa60c7bea8d4e",
+  "scripts/selfcheck.sh": "93b73d189cd316fd9674201c5012e8f083f143f5612e688535457a4b9d9a13df",
+  "tests/test_app.py": "dd48aaf6f96f8dbb4fc2248c96adeaafe61e2dc5fea4d140b6a7bb6a6f50ab9e",
+  "tests/test_risk.py": "a91c305de8fa409e4647c224dc87a3ab48bc6e373a51955ee53c8b9cffcc3217",
   "vercel.json": "ed8f3a2b0fbc72ff8dccf6e1a8ed8886b313a4f8bdc737224d9b87031d0db9c6"
 }

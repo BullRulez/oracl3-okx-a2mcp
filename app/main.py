@@ -1,24 +1,33 @@
+import asyncio
 import os
 import re
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
 
 from .risk import summarize
 
-app = FastAPI(title="AMilliMATRiX ORACL3 Token Preflight", version="0.1.0")
+VERSION = "0.1.1"
+UPSTREAM_TOTAL_TIMEOUT_SECONDS = 15.0
+app = FastAPI(title="AMilliMATRiX ORACL3 Token Preflight", version=VERSION)
 
 ADDRESS = re.compile(r"^0x[a-fA-F0-9]{40}$")
 GOPLUS = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
 
+@app.get("/", include_in_schema=False)
+async def entry():
+    return RedirectResponse("/docs", status_code=307)
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "ORACL3 Token Preflight", "version": "0.1.0"}
+    return {"status": "ok", "service": "ORACL3 Token Preflight", "version": VERSION,
+            "x402_enabled": X402_ENABLED}
 
 @app.get("/v1/token-preflight/{chain_id}/{contract_address}")
 async def token_preflight(chain_id: str, contract_address: str):
-    if not chain_id.isdigit():
+    if not chain_id.isascii() or not chain_id.isdigit():
         raise HTTPException(400, "chain_id must be numeric")
-    if not ADDRESS.match(contract_address):
+    if not ADDRESS.fullmatch(contract_address):
         raise HTTPException(400, "contract_address must be a 20-byte EVM address")
 
     headers = {"accept": "application/json"}
@@ -26,15 +35,32 @@ async def token_preflight(chain_id: str, contract_address: str):
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        r = await client.get(
-            GOPLUS.format(chain_id=chain_id),
-            params={"contract_addresses": contract_address},
-            headers=headers,
-        )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+            r = await asyncio.wait_for(client.get(
+                GOPLUS.format(chain_id=chain_id),
+                params={"contract_addresses": contract_address},
+                headers=headers,
+            ), timeout=UPSTREAM_TOTAL_TIMEOUT_SECONDS)
+    except (httpx.TimeoutException, asyncio.TimeoutError):
+        raise HTTPException(504, "security upstream timed out") from None
+    except httpx.RequestError:
+        raise HTTPException(502, "security upstream could not be reached") from None
     if r.status_code != 200:
         raise HTTPException(502, f"security upstream returned HTTP {r.status_code}")
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError:
+        raise HTTPException(502, "security upstream returned invalid JSON") from None
+    if not isinstance(data, dict):
+        raise HTTPException(502, "security upstream returned an invalid response")
+    if "code" in data and str(data["code"]) != "1":
+        raise HTTPException(502, "security upstream reported a provider error")
+    result = data.get("result")
+    if result is not None and (not isinstance(result, dict) or
+                              any(not isinstance(k, str) or not isinstance(v, dict)
+                                  for k, v in result.items())):
+        raise HTTPException(502, "security upstream returned an invalid token record")
     out = summarize(data, contract_address)
     out.update({
         "chain_id": chain_id,

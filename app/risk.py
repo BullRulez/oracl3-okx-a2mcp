@@ -20,12 +20,14 @@ def _truthy(v):
     return str(v).strip().lower() in {"1","true","yes"}
 
 def summarize(raw: dict, address: str) -> dict:
-    item = ((raw or {}).get("result") or {}).get(address.lower())
+    result = raw.get("result") if isinstance(raw, dict) else None
+    result = result if isinstance(result, dict) else {}
+    item = result.get(address.lower())
     if item is None:
         # Some upstream responses preserve checksum case.
-        result = (raw or {}).get("result") or {}
-        item = next((v for k,v in result.items() if k.lower() == address.lower()), None)
-    if not item:
+        item = next((v for k,v in result.items()
+                     if isinstance(k, str) and k.lower() == address.lower()), None)
+    if not isinstance(item, dict) or not item:
         return {
             "status": "insufficient_evidence",
             "risk": "unknown",
@@ -33,6 +35,14 @@ def summarize(raw: dict, address: str) -> dict:
             "reason": "No token-security record returned for the requested contract.",
         }
 
+    risk_keys = list(HIGH_RISK_TRUE) + list(CAUTION_TRUE)
+    observed = [key for key in risk_keys
+                if str(item.get(key)).strip().lower() in {"0", "1", "true", "false", "yes", "no"}]
+    if not observed:
+        return {
+            "status": "insufficient_evidence", "risk": "unknown", "flags": [],
+            "reason": "Token metadata was returned without usable risk flags.",
+        }
     high = [label for key,label in HIGH_RISK_TRUE.items() if _truthy(item.get(key))]
     caution = [label for key,label in CAUTION_TRUE.items() if _truthy(item.get(key))]
     if high:
@@ -46,6 +56,10 @@ def summarize(raw: dict, address: str) -> dict:
         "status": "ok",
         "risk": risk,
         "flags": high + caution,
+        "evidence_coverage": {
+            "observed_risk_fields": observed,
+            "missing_risk_fields": [key for key in risk_keys if key not in observed],
+        },
         "evidence": {
             "token_name": item.get("token_name"),
             "token_symbol": item.get("token_symbol"),
