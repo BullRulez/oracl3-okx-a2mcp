@@ -23,6 +23,41 @@ async def health():
     return {"status": "ok", "service": "ORACL3 Token Preflight", "version": VERSION,
             "x402_enabled": X402_ENABLED}
 
+@app.get("/_ops/tls-rejection-check", include_in_schema=False)
+async def tls_rejection_check():
+    """Temporary, fixed-target check for Render's eMudhra certificate advisory."""
+    targets = [
+        "https://dv-g3b-emudhra.we-have-a-problem.com/",
+        "https://dv-g3b-aaa-emudhra.we-have-a-problem.com/",
+    ]
+    results = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as client:
+        for target in targets:
+            try:
+                response = await client.get(target, follow_redirects=False)
+            except httpx.RequestError as exc:
+                detail = str(exc)
+                rejected = (
+                    "CERTIFICATE_VERIFY_FAILED" in detail
+                    or "certificate verify failed" in detail.lower()
+                    or "certificate verify failed" in repr(exc).lower()
+                )
+                results.append({
+                    "host": target.split("/")[2],
+                    "result": "CERTIFICATE_REJECTED" if rejected else "INCONCLUSIVE",
+                    "exception": type(exc).__name__,
+                    "detail": detail[:200],
+                })
+            else:
+                results.append({
+                    "host": target.split("/")[2],
+                    "result": "UNSAFE_TLS_ACCEPTED",
+                    "http_status": response.status_code,
+                })
+    passed = all(item["result"] == "CERTIFICATE_REJECTED" for item in results)
+    return {"status": "PASS" if passed else "HOLD", "checks": results}
+
+
 @app.get("/v1/token-preflight/{chain_id}/{contract_address}")
 async def token_preflight(chain_id: str, contract_address: str):
     if not chain_id.isascii() or not chain_id.isdigit():
