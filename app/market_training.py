@@ -87,11 +87,11 @@ async def _dynamic(client, chain_id, address):
         return {"available": False, "error": "binance_market_data_request_failed"}
 
 
-async def _candles(client, address):
+async def _candles(client, address, interval="1h", limit=8):
     try:
         payload = await _get_json(
             client, KLINE_URL,
-            params={"platform": "bsc", "address": address, "interval": "1h", "limit": 8},
+            params={"platform": "bsc", "address": address, "interval": interval, "limit": limit},
         )
         candles = payload.get("data")
         if not isinstance(candles, list):
@@ -114,6 +114,259 @@ async def _candles(client, address):
         }
     except (httpx.HTTPError, ValueError, TypeError):
         return {"available": False, "error": "candle_data_request_failed"}
+
+
+_INTERVAL_MS = {
+    "5min": 5 * 60 * 1000,
+    "15min": 15 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "4h": 4 * 60 * 60 * 1000,
+    "1d": 24 * 60 * 60 * 1000,
+}
+_STALE_LIMIT_MS = {
+    "5min": 10 * 60 * 1000,
+    "15min": 30 * 60 * 1000,
+    "1h": 2 * 60 * 60 * 1000,
+    "4h": 8 * 60 * 60 * 1000,
+    "1d": 36 * 60 * 60 * 1000,
+}
+
+
+def _ema_series(values, period):
+    """Simple-average seeded EMA; None until a full seed window exists."""
+    if period < 1:
+        raise ValueError("period must be positive")
+    result = [None] * len(values)
+    if len(values) < period:
+        return result
+    seed = sum(values[:period]) / period
+    result[period - 1] = seed
+    alpha = 2.0 / (period + 1)
+    previous = seed
+    for i in range(period, len(values)):
+        previous = alpha * values[i] + (1.0 - alpha) * previous
+        result[i] = previous
+    return result
+
+
+def _rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(change, 0.0) for change in changes]
+    losses = [max(-change, 0.0) for change in changes]
+    average_gain = sum(gains[:period]) / period
+    average_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        average_gain = ((period - 1) * average_gain + gains[i]) / period
+        average_loss = ((period - 1) * average_loss + losses[i]) / period
+    if average_gain == 0 and average_loss == 0:
+        return 50.0
+    if average_loss == 0:
+        return 100.0
+    if average_gain == 0:
+        return 0.0
+    relative_strength = average_gain / average_loss
+    return 100.0 - (100.0 / (1.0 + relative_strength))
+
+
+def _atr(candles, period=14):
+    if len(candles) < period + 1:
+        return None
+    true_ranges = []
+    for i in range(1, len(candles)):
+        current, previous = candles[i], candles[i - 1]
+        true_ranges.append(max(
+            current["high"] - current["low"],
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"]),
+        ))
+    value = sum(true_ranges[:period]) / period
+    for true_range in true_ranges[period:]:
+        value = ((period - 1) * value + true_range) / period
+    return value
+
+
+def _macd(values, fast=12, slow=26, signal=9):
+    if len(values) < slow + signal - 1:
+        return {"line": None, "signal": None, "histogram": None}
+    fast_ema = _ema_series(values, fast)
+    slow_ema = _ema_series(values, slow)
+    macd_values = []
+    for i in range(len(values)):
+        if fast_ema[i] is not None and slow_ema[i] is not None:
+            macd_values.append(fast_ema[i] - slow_ema[i])
+    signal_values = _ema_series(macd_values, signal)
+    if not macd_values or signal_values[-1] is None:
+        return {"line": macd_values[-1] if macd_values else None, "signal": None, "histogram": None}
+    line_value = macd_values[-1]
+    signal_value = signal_values[-1]
+    return {"line": line_value, "signal": signal_value, "histogram": line_value - signal_value}
+
+
+def _iso_utc_from_ms(value):
+    return dt.datetime.fromtimestamp(value / 1000.0, tz=dt.timezone.utc).isoformat()
+
+
+def _technical_frame(candle_result, interval, now_ms=None):
+    """Calculate multi-indicator TA on closed candles only; no trade instruction."""
+    if now_ms is None:
+        now_ms = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+    interval_ms = _INTERVAL_MS[interval]
+    raw = candle_result.get("candles", []) if candle_result.get("available") else []
+    closed = [
+        candle for candle in raw
+        if candle.get("timestamp_ms") is not None
+        and int(candle["timestamp_ms"]) + interval_ms <= now_ms
+    ]
+    closed.sort(key=lambda candle: candle["timestamp_ms"])
+    last = closed[-1] if closed else None
+    age_ms = now_ms - (int(last["timestamp_ms"]) + interval_ms) if last else None
+    stale = age_ms is None or age_ms > _STALE_LIMIT_MS[interval]
+    closes = [candle["close"] for candle in closed]
+    ema9s = _ema_series(closes, 9)
+    ema21s = _ema_series(closes, 21)
+    ema50s = _ema_series(closes, 50)
+    current = closes[-1] if closes else None
+    ema9 = ema9s[-1] if ema9s else None
+    ema21 = ema21s[-1] if ema21s else None
+    ema50 = ema50s[-1] if ema50s else None
+    rsi14 = _rsi(closes, 14)
+    atr14 = _atr(closed, 14)
+    macd = _macd(closes)
+    volume_ratio = None
+    if len(closed) >= 21:
+        prior_volumes = [candle["volume"] for candle in closed[-21:-1]]
+        average_prior_volume = sum(prior_volumes) / len(prior_volumes)
+        if average_prior_volume > 0:
+            volume_ratio = closed[-1]["volume"] / average_prior_volume
+
+    trend = "INSUFFICIENT_DATA"
+    if current is not None and None not in (ema9, ema21, ema50):
+        if current > ema9 > ema21 > ema50:
+            trend = "BULLISH"
+        elif current < ema9 < ema21 < ema50:
+            trend = "BEARISH"
+        else:
+            trend = "MIXED"
+
+    momentum = "INSUFFICIENT_DATA"
+    if rsi14 is not None:
+        if rsi14 >= 70:
+            momentum = "OVERBOUGHT_ZONE"
+        elif rsi14 >= 55:
+            momentum = "POSITIVE"
+        elif rsi14 <= 30:
+            momentum = "OVERSOLD_ZONE"
+        elif rsi14 <= 45:
+            momentum = "NEGATIVE"
+        else:
+            momentum = "NEUTRAL"
+
+    candle_pattern = "INSUFFICIENT_DATA"
+    swing_structure = "INSUFFICIENT_DATA"
+    if len(closed) >= 3:
+        a, b, c = closed[-3:]
+        if c["high"] > b["high"] > a["high"] and c["low"] > b["low"] > a["low"]:
+            swing_structure = "HIGHER_HIGHS_HIGHER_LOWS"
+        elif c["high"] < b["high"] < a["high"] and c["low"] < b["low"] < a["low"]:
+            swing_structure = "LOWER_HIGHS_LOWER_LOWS"
+        else:
+            swing_structure = "MIXED"
+    if len(closed) >= 2:
+        previous, current_candle = closed[-2:]
+        if current_candle["close"] > current_candle["open"] and current_candle["close"] > previous["close"] and current_candle["low"] >= previous["low"]:
+            candle_pattern = "CONFIRMED_BULLISH_CANDLE_REVERSAL"
+        elif current_candle["close"] < current_candle["open"] and current_candle["close"] < previous["close"] and current_candle["high"] <= previous["high"]:
+            candle_pattern = "CONFIRMED_BEARISH_CANDLE_REVERSAL"
+        else:
+            candle_pattern = "NO_CONFIRMED_REVERSAL"
+
+    returns = {}
+    for bars, label in ((2, "2_bar"), (3, "3_bar"), (12, "12_bar")):
+        if len(closes) > bars and closes[-bars - 1] != 0:
+            returns[f"{label}_return_pct"] = (closes[-1] / closes[-bars - 1] - 1.0) * 100.0
+        else:
+            returns[f"{label}_return_pct"] = None
+
+    macd_bias = "UNKNOWN"
+    if macd["histogram"] is not None:
+        macd_bias = "POSITIVE" if macd["histogram"] > 0 else ("NEGATIVE" if macd["histogram"] < 0 else "FLAT")
+
+    close_vs_ema21 = None if current is None or ema21 is None or ema21 == 0 else (current / ema21 - 1.0) * 100.0
+    atr_pct = None if current is None or current == 0 or atr14 is None else atr14 / current * 100.0
+    bias = "INSUFFICIENT_DATA"
+    if not stale and trend != "INSUFFICIENT_DATA" and rsi14 is not None and macd["histogram"] is not None:
+        if trend == "BULLISH" and rsi14 > 50 and macd["histogram"] > 0:
+            bias = "BULLISH"
+        elif trend == "BEARISH" and rsi14 < 50 and macd["histogram"] < 0:
+            bias = "BEARISH"
+        else:
+            bias = "MIXED"
+
+    return {
+        "timeframe": interval,
+        "candles_returned": len(raw),
+        "closed_candles_used": len(closed),
+        "required_for_full_indicator_set": 60,
+        "last_closed_candle_end_utc": _iso_utc_from_ms(int(last["timestamp_ms"]) + interval_ms) if last else None,
+        "age_since_last_closed_candle_seconds": round(age_ms / 1000.0, 2) if age_ms is not None else None,
+        "stale": stale,
+        "last_closed_price": current,
+        "ema_9": ema9,
+        "ema_21": ema21,
+        "ema_50": ema50,
+        "price_vs_ema21_pct": close_vs_ema21,
+        "rsi_14": rsi14,
+        "rsi_zone": momentum,
+        "macd_12_26_9": macd,
+        "macd_bias": macd_bias,
+        "atr_14": atr14,
+        "atr_percent_of_price": atr_pct,
+        "latest_volume_vs_prior_20_bar_average": volume_ratio,
+        "swing_structure_last_3_bars": swing_structure,
+        "candle_pattern_last_2_bars": candle_pattern,
+        "recent_returns_pct": returns,
+        "trend": trend,
+        "technical_bias": bias,
+        "data_quality": (
+            "STALE_OR_UNAVAILABLE" if stale
+            else ("SHORT_HISTORY" if len(closed) < 60 else "ADEQUATE_FOR_INDICATORS")
+        ),
+        "interpretation_limit": "Indicator alignment is a heuristic, not a calibrated probability or a buy/sell instruction.",
+    }
+
+
+def _progression_ladder(start_amount_usd=0.40, step_multiple=2.0, max_steps=12, goal_usd=400.0):
+    balance = float(start_amount_usd)
+    rows = [{
+        "step": 0, "starting_balance_usd": round(balance, 8),
+        "target_balance_usd": round(balance, 8), "gross_multiple_from_start": 1.0,
+        "gross_profit_from_start_usd": 0.0,
+    }]
+    for step in range(1, max_steps + 1):
+        next_balance = balance * step_multiple
+        rows.append({
+            "step": step,
+            "starting_balance_usd": round(balance, 8),
+            "target_balance_usd": round(next_balance, 8),
+            "gross_multiple_from_start": round(next_balance / start_amount_usd, 8),
+            "gross_profit_from_start_usd": round(next_balance - start_amount_usd, 8),
+            "step_multiple": step_multiple,
+            "goal_reached": next_balance >= goal_usd,
+        })
+        balance = next_balance
+    first = next((row["step"] for row in rows if row["target_balance_usd"] >= goal_usd), None)
+    return {
+        "start_floor_usd": round(start_amount_usd, 8),
+        "target_multiple_each_step": step_multiple,
+        "gross_goal_usd": round(goal_usd, 8),
+        "minimum_successive_doublings_to_reach_goal": first,
+        "balance_after_goal_step_usd": next((row["target_balance_usd"] for row in rows if row["step"] == first), None) if first is not None else None,
+        "all_values_gross_before_costs": True,
+        "not_a_trade_instruction": True,
+        "steps": rows,
+    }
 
 
 async def _risk(client, chain_id, address):
@@ -680,6 +933,7 @@ async def market_screen(
             "gross_profit_before_costs_usd": round(target_value - start_amount_usd, 8),
             "required_return_pct": round((target_multiple - 1) * 100, 4),
             "interpretation": "Arithmetic only, not a forecast or probability. Excludes gas, swap fees, slippage, taxes, failed transactions, and exit liquidity.",
+            "doubling_progression": _progression_ladder(start_amount_usd, 2.0, 12, target_value),
         },
         "candidates": evaluated,
         "decision_rule": {
@@ -689,4 +943,86 @@ async def market_screen(
             "score_is_probability": False,
         },
         "disclaimer": "Read-only training evidence; no result is a live buy instruction or proof of safety.",
+    }
+
+
+@router.get("/v1/technical-analysis/{chain_id}/{contract_address}")
+async def technical_analysis(
+    chain_id: str,
+    contract_address: str,
+    start_amount_usd: float = Query(default=0.40, gt=0, le=1_000_000),
+    goal_usd: float = Query(default=400.0, gt=0, le=1_000_000_000),
+    step_multiple: float = Query(default=2.0, gt=1.0, le=10.0),
+):
+    """Read-only multi-timeframe TA and progression math; does not execute a trade."""
+    if chain_id != "56":
+        raise HTTPException(400, "technical-analysis candidate currently supports BSC chain_id 56 only")
+    if not EVM_ADDRESS.fullmatch(contract_address):
+        raise HTTPException(400, "invalid EVM contract address")
+    retrieved_at = _utc_now()
+    intervals = ("5min", "15min", "1h", "4h", "1d")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=4.0),
+                                     headers={"accept": "application/json", "User-Agent": "AMX-GLOR3-Technical-Analysis/0.1"}) as client:
+            frames_raw = await asyncio.gather(*(
+                _candles(client, contract_address, interval=interval, limit=100)
+                for interval in intervals
+            ))
+    except (httpx.TimeoutException, asyncio.TimeoutError):
+        raise HTTPException(504, "technical-analysis candle request timed out") from None
+    except (httpx.HTTPError, ValueError, TypeError):
+        raise HTTPException(502, "technical-analysis upstream request failed") from None
+
+    frames = {
+        interval: _technical_frame(result, interval)
+        for interval, result in zip(intervals, frames_raw)
+    }
+    core = [frames[interval] for interval in ("5min", "15min", "1h")]
+    core_bullish = sum(frame["technical_bias"] == "BULLISH" for frame in core)
+    core_bearish = sum(frame["technical_bias"] == "BEARISH" for frame in core)
+    missing_or_stale = sum(frame["stale"] or frame["technical_bias"] == "INSUFFICIENT_DATA" for frame in core)
+    higher_bullish = sum(frames[interval]["technical_bias"] == "BULLISH" for interval in ("4h", "1d"))
+    higher_bearish = sum(frames[interval]["technical_bias"] == "BEARISH" for interval in ("4h", "1d"))
+
+    if missing_or_stale > 0:
+        overall = "INSUFFICIENT_OR_STALE_DATA"
+    elif core_bullish == 3 and higher_bearish == 0:
+        overall = "MULTI_TIMEFRAME_BULLISH_ALIGNMENT"
+    elif core_bearish == 3 and higher_bullish == 0:
+        overall = "MULTI_TIMEFRAME_BEARISH_ALIGNMENT"
+    else:
+        overall = "MIXED_OR_CONFLICTING_TIMEFRAMES"
+
+    progression = _progression_ladder(
+        start_amount_usd=start_amount_usd, step_multiple=step_multiple,
+        max_steps=12, goal_usd=goal_usd,
+    )
+    return {
+        "status": "technical_analysis_complete",
+        "service": "ORACL3 / GLOR3 Technical Analysis Candidate",
+        "chain_id": chain_id,
+        "contract_address": contract_address,
+        "retrieved_at_utc": retrieved_at,
+        "source": "Binance Web3 candles / dquery; indicators calculated locally from closed OHLCV candles",
+        "method": {
+            "timeframes": list(intervals),
+            "indicators": ["EMA 9/21/50", "RSI 14", "MACD 12/26/9", "ATR 14", "20-bar relative volume", "swing structure", "multi-timeframe alignment"],
+            "incomplete_candles_excluded": True,
+            "staleness_gated_per_timeframe": True,
+            "technical_bias_is_probability": False,
+            "no_wallet_or_transaction_capability": True,
+        },
+        "overall_reading": overall,
+        "core_timeframe_counts": {
+            "bullish": core_bullish, "bearish": core_bearish, "missing_or_stale": missing_or_stale,
+            "higher_timeframe_bullish": higher_bullish, "higher_timeframe_bearish": higher_bearish,
+        },
+        "timeframes": frames,
+        "progression_ladder": progression,
+        "execution_policy": {
+            "live_trading_enabled": False,
+            "live_order_submitted": False,
+            "next_step": "paper-trade and score the signal against later closed-candle outcomes; do not infer permission to place an order",
+        },
+        "interpretation_limit": "Technical analysis is descriptive and probabilistic, not predictive certainty. A 2x ladder is a gross objective; no candidate, hit rate, or net profitability is guaranteed.",
     }
