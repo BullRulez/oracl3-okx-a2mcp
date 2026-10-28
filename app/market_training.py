@@ -311,9 +311,16 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
     binance_buy_tax = binance_buy_tax_raw
     binance_sell_tax = binance_sell_tax_raw
     tax_sources_disagree = (
-        buy_tax is not None and binance_buy_tax is not None and abs(buy_tax-binance_buy_tax) > 0.02
+        buy_tax is not None and binance_buy_tax is not None and abs(buy_tax-binance_buy_tax) > 0.002
     ) or (
-        sell_tax is not None and binance_sell_tax is not None and abs(sell_tax-binance_sell_tax) > 0.02
+        sell_tax is not None and binance_sell_tax is not None and abs(sell_tax-binance_sell_tax) > 0.002
+    )
+    tax_unit_semantics_verified = bool(
+        buy_tax is not None and sell_tax is not None
+        and binance_buy_tax is not None and binance_sell_tax is not None
+        and 0 <= buy_tax <= 0.05 and 0 <= sell_tax <= 0.05
+        and 0 <= binance_buy_tax <= 0.05 and 0 <= binance_sell_tax <= 0.05
+        and not tax_sources_disagree
     )
     price = _positive(market.get("price"))
     high_24h = _positive(market.get("priceHigh24h"))
@@ -399,13 +406,11 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
         reasons.append("security_risk_coverage_incomplete")
     else:
         reasons.append("security_evidence_unknown_or_caution")
-    if (buy_tax is not None and sell_tax is not None and max(buy_tax, sell_tax) <= 0.05
-            and binance_buy_tax is not None and binance_sell_tax is not None
-            and max(binance_buy_tax, binance_sell_tax) <= 0.05 and not tax_sources_disagree):
+    if tax_unit_semantics_verified:
         score += 5
-        reasons.append("raw_tax_values_numerically_agree_and_are_under_5pct; unit_semantics_still_unverified")
+        reasons.append("per_contract_tax_values_cross_check_between_oracl3_and_binance")
     else:
-        reasons.append("tax_missing_high_or_not_cross_validated")
+        reasons.append("tax_missing_high_unit_unverified_or_not_cross_validated")
     if (binance_audit.get("available") and binance_audit.get("risk_assessment_confirmed")
             and binance_audit.get("risk_level_enum") == "LOW"
             and not binance_audit.get("hard_risk_hits")):
@@ -439,10 +444,8 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
         hard_blocks.append("holder_concentration_unknown_or_over_35pct")
     if dev_pct is None or dev_pct > 5:
         hard_blocks.append("developer_concentration_unknown_or_over_5pct")
-    if (buy_tax is None or sell_tax is None or max(buy_tax, sell_tax) > 0.05
-            or binance_buy_tax is None or binance_sell_tax is None
-            or max(binance_buy_tax, binance_sell_tax) > 0.05 or tax_sources_disagree):
-        hard_blocks.append("tax_not_cross_verified_under_5pct")
+    if not tax_unit_semantics_verified:
+        hard_blocks.append("tax_missing_high_unit_unverified_or_not_cross_verified_under_5pct")
     if market_cap is None or not (5_000 <= market_cap <= 250_000):
         hard_blocks.append("market_cap_outside_research_band")
     if liquidity is None or liquidity < DEFAULT_MIN_LIQUIDITY:
@@ -494,7 +497,15 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
             "sell_tax_fraction_oracl3": sell_tax,
             "buy_tax_raw_binance": binance_buy_tax_raw,
             "sell_tax_raw_binance": binance_sell_tax_raw,
-            "binance_tax_unit_semantics_verified": False,
+            "tax_cross_check": {
+                "oracl3_buy_tax_fraction": buy_tax,
+                "oracl3_sell_tax_fraction": sell_tax,
+                "binance_buy_tax_raw": binance_buy_tax_raw,
+                "binance_sell_tax_raw": binance_sell_tax_raw,
+                "numerically_agree_within_0_002": not tax_sources_disagree,
+                "per_contract_low_tax_cross_check_pass": tax_unit_semantics_verified,
+                "note": "Raw Binance audit values are not scaled. Numeric alignment is only per-contract evidence; provider documentation and other endpoints may encode tax units differently."
+            },
             "tax_sources_disagree": tax_sources_disagree,
             "target_market_cap_if_1000x_usd": target_cap,
         },
