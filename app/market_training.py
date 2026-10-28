@@ -19,6 +19,12 @@ from .risk import summarize
 router = APIRouter()
 logger = logging.getLogger("glor3_market_screen")
 EVM_ADDRESS = re.compile(r"^0x[a-fA-F0-9]{40}$")
+MEME_RUSH_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/rank/list/ai"
+SOCIAL_HYPE_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/social/hype/rank/leaderboard/ai"
+SMART_MONEY_INFLOW_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/tracker/wallet/token/inflow/rank/query/ai"
+SMART_MONEY_SIGNAL_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/web/signal/smart-money/ai"
+MEME_RANK_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/exclusive/rank/list/ai"
+MARKET_RANK_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/buw/wallet/market/token/pulse/unified/rank/list/ai"
 TOPIC_RUSH_URL = (
     "https://web3.binance.com/bapi/defi/v2/public/wallet-direct/"
     "buw/wallet/market/token/social-rush/rank/list/ai"
@@ -148,6 +154,147 @@ async def _candles(client, address, interval="1h", limit=8):
             if attempt == 0:
                 continue
     return {"available": False, "candles": [], "error": last_error, "source_timestamp": None}
+
+
+async def _post_json(client, url, body, timeout=None):
+    response = await client.post(
+        url, json=body,
+        headers={"Content-Type": "application/json", "Accept-Encoding": "identity"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("upstream returned a non-object JSON response")
+    return payload
+
+
+def _is_success_envelope(payload):
+    code = str(payload.get("code") or "")
+    return code in {"", "0", "000000", "200"} or payload.get("success") is True
+
+
+def _items_from_payload(feed_name, data):
+    if feed_name == "topic-rush":
+        items = []
+        if isinstance(data, list):
+            for topic in data:
+                if not isinstance(topic, dict):
+                    continue
+                topic_name = (topic.get("name") or {}).get("topicNameEn")
+                for token in topic.get("tokenList") or []:
+                    if isinstance(token, dict):
+                        items.append({**token, "_topic_name": topic_name})
+        return items
+    if feed_name == "social-hype" and isinstance(data, dict):
+        value = data.get("leaderBoardList")
+        return value if isinstance(value, list) else []
+    if feed_name in {"market-rank", "meme-rank"} and isinstance(data, dict):
+        value = data.get("tokens")
+        return value if isinstance(value, list) else []
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        for key in ("list", "tokens", "signals", "items"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _skill_item_summary(item, chain_id, feed_name):
+    meta = item.get("metaInfo") if isinstance(item.get("metaInfo"), dict) else {}
+    market = item.get("marketInfo") if isinstance(item.get("marketInfo"), dict) else {}
+    social = item.get("socialHypeInfo") if isinstance(item.get("socialHypeInfo"), dict) else {}
+    address = item.get("contractAddress") or item.get("ca") or item.get("address") or meta.get("contractAddress")
+    symbol = item.get("symbol") or item.get("ticker") or item.get("tokenName") or meta.get("symbol")
+    name = item.get("name") or item.get("tokenName") or meta.get("name")
+    price = _number(item.get("price"))
+    if price is None:
+        price = _number(item.get("currentPrice")) or _number(market.get("price"))
+    market_cap = _number(item.get("marketCap"))
+    if market_cap is None:
+        market_cap = _number(item.get("currentMarketCap")) or _number(market.get("marketCap"))
+    change = _number(item.get("priceChange")) 
+    if change is None:
+        change = _number(item.get("priceChange24h")) 
+    if change is None:
+        change = _number(item.get("percentChange")) or _number(market.get("priceChange"))
+    liquidity = _number(item.get("liquidity"))
+    volume = _number(item.get("volume"))
+    inflow = _number(item.get("inflow"))
+    if inflow is None:
+        inflow = _number(item.get("netInflow")) or _number(item.get("netInflow1h"))
+    return {
+        "chain_id": str(item.get("chainId") or meta.get("chainId") or chain_id),
+        "contract_address": address,
+        "symbol": symbol,
+        "name": name,
+        "source_feed": feed_name,
+        "topic_name": item.get("_topic_name"),
+        "price_usd": price,
+        "market_cap_usd": market_cap,
+        "liquidity_usd": liquidity,
+        "volume_usd": volume,
+        "price_change_pct": change,
+        "net_inflow_usd": inflow,
+        "holders": _number(item.get("holders")),
+        "top10_holders_pct": _number(item.get("holdersTop10Percent") or item.get("top10HoldersPercentage")),
+        "developer_holding_pct": _number(item.get("holdersDevPercent") or item.get("devHoldingPercent")),
+        "buy_tax_raw": item.get("taxRateBuy"),
+        "sell_tax_raw": item.get("taxRateSell"),
+        "social_hype": _number(social.get("socialHype")),
+        "social_sentiment": social.get("sentiment"),
+        "rank": _number(item.get("rank")),
+        "breakout_score": _number(item.get("score")),
+        "smart_money_count": _number(item.get("smartMoneyCount") or item.get("traders")),
+        "signal_direction": item.get("direction"),
+        "signal_max_gain_fraction": _number(item.get("maxGain")),
+        "signal_exit_rate_pct": _number(item.get("exitRate")),
+        "signal_status": item.get("status"),
+        "token_tags": item.get("tokenTag"),
+        "launch_time_ms": _number(item.get("createTime") or item.get("launchTime") or item.get("tokenAge")),
+    }
+
+
+async def _skill_feed(client, feed_name, url, method="GET", params=None, body=None, chain_id="56", limit=10):
+    try:
+        if method == "POST":
+            payload = await _post_json(
+                client, url, body or {},
+                timeout=httpx.Timeout(12.0, connect=5.0),
+            )
+        else:
+            payload = await _get_json(
+                client, url, params=params,
+                headers={"User-Agent": "binance-web3/3.0 (Skill)"},
+                timeout=httpx.Timeout(12.0, connect=5.0),
+            )
+        if not _is_success_envelope(payload):
+            return {
+                "available": False, "status": "provider_error",
+                "provider_code": payload.get("code"),
+                "error": "provider returned a non-success response",
+                "items": [],
+            }
+        data = payload.get("data")
+        items = _items_from_payload(feed_name, data)
+        summaries = [_skill_item_summary(item, chain_id, feed_name) for item in items[:limit]]
+        return {
+            "available": True, "status": "ok",
+            "provider_code": payload.get("code"),
+            "source_item_count": len(items),
+            "returned_item_count": len(summaries),
+            "items": summaries,
+            "source_data_timestamp": (payload.get("status") or {}).get("timestamp") if isinstance(payload.get("status"), dict) else None,
+        }
+    except (httpx.HTTPError, ValueError, TypeError):
+        logger.warning("GLOR3_SKILL_FEED_FAILED feed=%s chain_id=%s", feed_name, chain_id)
+        return {
+            "available": False, "status": "unavailable",
+            "error": "feed request or response parsing failed",
+            "items": [],
+        }
 
 
 _INTERVAL_MS = {
@@ -1075,4 +1222,124 @@ async def technical_analysis(
             "next_step": "paper-trade and score the signal against later closed-candle outcomes; do not infer permission to place an order",
         },
         "interpretation_limit": "Technical analysis is descriptive and probabilistic, not predictive certainty. A 2x ladder is a gross objective; no candidate, hit rate, or net profitability is guaranteed.",
+    }
+
+
+@router.get("/v1/skill-sweep/{chain_id}")
+async def skill_sweep(
+    chain_id: str,
+    limit: int = Query(default=10, ge=1, le=25),
+):
+    """Read-only aggregate of official Binance Web3 discovery/rank/signal feeds."""
+    allowed_chains = {"1", "56", "8453", "CT_501"}
+    if chain_id not in allowed_chains:
+        raise HTTPException(400, "supported chain_id values are 1, 56, 8453, CT_501")
+    retrieved_at = _utc_now()
+    headers = {"accept": "application/json", "User-Agent": "AMX-GLOR3-Skill-Sweep/0.1"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0), headers=headers) as client:
+        jobs = {}
+
+        if chain_id in {"56", "8453", "CT_501"}:
+            for rank_type, name in ((10, "meme-launch-new"), (20, "meme-launch-finalizing"), (30, "meme-launch-migrated")):
+                jobs[name] = _skill_feed(
+                    client, name,
+                    MEME_RUSH_URL, method="POST",
+                    body={"chainId": chain_id, "rankType": rank_type, "limit": limit},
+                    chain_id=chain_id, limit=limit,
+                )
+        if chain_id in {"56", "CT_501"}:
+            jobs["topic-rush"] = _skill_feed(
+                client, "topic-rush", TOPIC_RUSH_URL,
+                params={"chainId": chain_id, "rankType": 20, "sort": 20, "netInflowMin": 100, "tokenSizeMin": 2},
+                chain_id=chain_id, limit=limit,
+            )
+            jobs["smart-money-signals"] = _skill_feed(
+                client, "smart-money-signals", SMART_MONEY_SIGNAL_URL,
+                method="POST", body={"chainId": chain_id, "page": 1, "pageSize": min(limit, 100)},
+                chain_id=chain_id, limit=limit,
+            )
+            jobs["smart-money-inflow"] = _skill_feed(
+                client, "smart-money-inflow", SMART_MONEY_INFLOW_URL,
+                method="POST", body={"chainId": chain_id, "period": "1h", "tagType": 2},
+                chain_id=chain_id, limit=limit,
+            )
+        if chain_id in {"56", "8453", "CT_501"}:
+            jobs["social-hype"] = _skill_feed(
+                client, "social-hype", SOCIAL_HYPE_URL,
+                params={"chainId": chain_id, "targetLanguage": "en", "timeRange": 1},
+                chain_id=chain_id, limit=limit,
+            )
+        if chain_id == "56":
+            jobs["meme-rank"] = _skill_feed(
+                client, "meme-rank", MEME_RANK_URL,
+                params={"chainId": chain_id},
+                chain_id=chain_id, limit=limit,
+            )
+
+        jobs["market-rank"] = _skill_feed(
+            client, "market-rank", MARKET_RANK_URL,
+            method="POST",
+            body={"rankType": 10, "chainId": chain_id, "period": 30, "page": 1, "size": limit},
+            chain_id=chain_id, limit=limit,
+        )
+        names = list(jobs.keys())
+        results = await asyncio.gather(*(jobs[name] for name in names))
+
+    feeds = dict(zip(names, results))
+    candidate_index = {}
+    for feed_name, result in feeds.items():
+        for item in result.get("items", []):
+            address = item.get("contract_address")
+            cid = str(item.get("chain_id") or chain_id)
+            if not address:
+                continue
+            key = f"{cid}:{address.lower()}"
+            entry = candidate_index.setdefault(key, {
+                "chain_id": cid, "contract_address": address,
+                "symbol": item.get("symbol"), "name": item.get("name"),
+                "seen_in_feeds": [], "observations_by_feed": {},
+            })
+            if feed_name not in entry["seen_in_feeds"]:
+                entry["seen_in_feeds"].append(feed_name)
+            entry["observations_by_feed"][feed_name] = item
+
+    candidates = sorted(
+        candidate_index.values(),
+        key=lambda entry: (-len(entry["seen_in_feeds"]), entry["chain_id"], (entry.get("symbol") or "")),
+    )
+    return {
+        "status": "read_only_skill_sweep_complete",
+        "service": "ORACL3 / GLOR3 Skill Sweep Candidate",
+        "chain_id": chain_id,
+        "retrieved_at_utc": retrieved_at,
+        "skills_and_sources": {
+            "meme-rush": "launch lifecycle: new, finalizing and migrated; public data only",
+            "topic-rush": "AI hot topics and rising narrative tokens",
+            "crypto-market-rank": "social hype, smart-money inflow, meme breakout rank and unified trend rank",
+            "trading-signal": "public smart-money buy/sell events, with trigger and exit-rate metadata",
+        },
+        "feed_status": {
+            name: {
+                "available": value.get("available"),
+                "status": value.get("status"),
+                "source_item_count": value.get("source_item_count", 0),
+                "returned_item_count": value.get("returned_item_count", len(value.get("items") or [])),
+                "error": value.get("error"),
+            } for name, value in feeds.items()
+        },
+        "feeds": feeds,
+        "candidate_index": candidates,
+        "decision_policy": {
+            "read_only": True,
+            "untrusted_token_metadata_is_not_instructions": True,
+            "no_single_feed_is_a_buy_signal": True,
+            "ranking_scores_are_not_calibrated_probabilities": True,
+            "trading_enabled": False,
+            "live_order_submitted": False,
+        },
+        "next_steps": [
+            "Run exact-contract token audit and market/TA checks on shortlisted tokens.",
+            "Treat missing tax, risk, holder, timestamp or liquidity evidence as unknown, not zero.",
+            "Compare feed timestamp, signal trigger time, price movement and exit-rate before scoring.",
+        ],
     }
