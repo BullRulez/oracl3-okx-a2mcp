@@ -87,6 +87,25 @@ async def _dynamic(client, chain_id, address):
         return {"available": False, "error": "binance_market_data_request_failed"}
 
 
+def _normalize_candle_rows(candles):
+    """Normalize OHLCV rows; trade count can legitimately be null on daily bars."""
+    normalized = []
+    for candle in candles:
+        if not isinstance(candle, list) or len(candle) < 7:
+            continue
+        values = [_number(candle[i]) for i in range(6)]
+        if any(value is None for value in values):
+            continue
+        trade_count = _number(candle[6])
+        normalized.append({
+            "open": values[0], "high": values[1], "low": values[2],
+            "close": values[3], "volume": values[4],
+            "timestamp_ms": int(values[5]),
+            "trades": int(trade_count) if trade_count is not None and trade_count >= 0 else None,
+        })
+    return normalized
+
+
 async def _candles(client, address, interval="1h", limit=8):
     """Read candle bars with one bounded retry; preserve unavailable vs empty data."""
     last_error = "candle_data_unavailable"
@@ -112,18 +131,7 @@ async def _candles(client, address, interval="1h", limit=8):
                     continue
                 return {"available": False, "candles": [], "error": last_error,
                         "source_timestamp": status.get("timestamp")}
-            normalized = []
-            for candle in candles:
-                if not isinstance(candle, list) or len(candle) < 7:
-                    continue
-                values = [_number(candle[i]) for i in range(6)]
-                if any(v is None for v in values):
-                    continue
-                normalized.append({
-                    "open": values[0], "high": values[1], "low": values[2],
-                    "close": values[3], "volume": values[4],
-                    "timestamp_ms": int(values[5]), "trades": int(candle[6]),
-                })
+            normalized = _normalize_candle_rows(candles)
             if not normalized:
                 last_error = "candle_rows_failed_validation"
                 if attempt == 0:
