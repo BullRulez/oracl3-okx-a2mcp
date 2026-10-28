@@ -339,14 +339,16 @@ def _evaluate(token, dynamic_result, risk, candle_result):
     hard_blocks = []
     if risk.get("risk") == "high":
         hard_blocks.append("security_high_risk")
+    elif risk.get("risk") != "no_flag_detected":
+        hard_blocks.append("security_caution_or_unknown")
     if risk.get("status") != "ok" or missing_risk:
         hard_blocks.append("security_evidence_incomplete")
     if token.get("symbol_contract_count", 1) > 1:
         hard_blocks.append("ambiguous_duplicate_symbol")
-    if top10 is None or top10 > 50:
-        hard_blocks.append("holder_concentration_unknown_or_over_50pct")
-    if dev_pct is None or dev_pct > 10:
-        hard_blocks.append("developer_concentration_unknown_or_over_10pct")
+    if top10 is None or top10 > 35:
+        hard_blocks.append("holder_concentration_unknown_or_over_35pct")
+    if dev_pct is None or dev_pct > 5:
+        hard_blocks.append("developer_concentration_unknown_or_over_5pct")
     if buy_tax is None or sell_tax is None or max(buy_tax, sell_tax) > 0.05:
         hard_blocks.append("tax_not_verified_under_5pct")
     if market_cap is None or not (5_000 <= market_cap <= 250_000):
