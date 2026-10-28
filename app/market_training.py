@@ -172,14 +172,26 @@ async def _binance_audit(client, chain_id, address):
                         "is_hit": detail.get("isHit"),
                     })
         level = _number(data.get("riskLevel"))
+        risk_enum = str(data.get("riskLevelEnum") or "").strip().upper() or None
+        hard_hits = [
+            item for item in details
+            if item.get("is_hit") is True and str(item.get("risk_type") or "").upper() == "RISK"
+        ]
+        assessed = risk_enum in {"LOW", "MEDIUM", "HIGH"} and level is not None
         return {
             "available": True,
-            "status": "ok",
+            "status": "ok" if assessed else "unassessed",
+            "risk_assessment_confirmed": assessed,
             "risk_level": int(level) if level is not None else None,
-            "risk_level_enum": data.get("riskLevelEnum"),
-            "buy_tax_pct": _number(extra.get("buyTax")),
-            "sell_tax_pct": _number(extra.get("sellTax")),
+            "risk_level_enum": risk_enum,
+            # Preserve provider values exactly. Binance's skill docs call these
+            # percentages, while live samples numerically match GoPlus fractions.
+            # Cross-check raw values against ORACL3; do not silently scale them.
+            "buy_tax_raw": _number(extra.get("buyTax")),
+            "sell_tax_raw": _number(extra.get("sellTax")),
+            "tax_unit_semantics_verified": False,
             "verified_contract": extra.get("isVerified"),
+            "hard_risk_hits": hard_hits,
             "risk_items": details,
         }
     except (httpx.HTTPError, ValueError, TypeError):
@@ -291,10 +303,13 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
         dev_pct = token["dev_holding_pct_feed"]
     buy_tax = _known_tax_fraction(evidence.get("buy_tax"))
     sell_tax = _known_tax_fraction(evidence.get("sell_tax"))
-    binance_buy_tax_pct = _number(binance_audit.get("buy_tax_pct"))
-    binance_sell_tax_pct = _number(binance_audit.get("sell_tax_pct"))
-    binance_buy_tax = binance_buy_tax_pct / 100.0 if binance_buy_tax_pct is not None and 0 <= binance_buy_tax_pct <= 100 else None
-    binance_sell_tax = binance_sell_tax_pct / 100.0 if binance_sell_tax_pct is not None and 0 <= binance_sell_tax_pct <= 100 else None
+    binance_buy_tax_raw = _number(binance_audit.get("buy_tax_raw"))
+    binance_sell_tax_raw = _number(binance_audit.get("sell_tax_raw"))
+    # Empirical numerical cross-check only. Provider documentation labels the
+    # Binance fields as percentages, but live values can match GoPlus fractions.
+    # Never convert units implicitly. Raw source-unit semantics stay unverified.
+    binance_buy_tax = binance_buy_tax_raw
+    binance_sell_tax = binance_sell_tax_raw
     tax_sources_disagree = (
         buy_tax is not None and binance_buy_tax is not None and abs(buy_tax-binance_buy_tax) > 0.02
     ) or (
@@ -384,16 +399,20 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
         reasons.append("security_risk_coverage_incomplete")
     else:
         reasons.append("security_evidence_unknown_or_caution")
-    if buy_tax is not None and sell_tax is not None and max(buy_tax, sell_tax) <= 0.05 and binance_buy_tax is not None and binance_sell_tax is not None and not tax_sources_disagree:
+    if (buy_tax is not None and sell_tax is not None and max(buy_tax, sell_tax) <= 0.05
+            and binance_buy_tax is not None and binance_sell_tax is not None
+            and max(binance_buy_tax, binance_sell_tax) <= 0.05 and not tax_sources_disagree):
         score += 5
-        reasons.append("both_sources_confirm_buy_and_sell_tax_at_most_5pct")
+        reasons.append("raw_tax_values_numerically_agree_and_are_under_5pct; unit_semantics_still_unverified")
     else:
         reasons.append("tax_missing_high_or_not_cross_validated")
-    if binance_audit.get("available") and binance_audit.get("risk_level") is not None and binance_audit.get("risk_level") <= 1:
+    if (binance_audit.get("available") and binance_audit.get("risk_assessment_confirmed")
+            and binance_audit.get("risk_level_enum") == "LOW"
+            and not binance_audit.get("hard_risk_hits")):
         score += 10
-        reasons.append("binance_audit_low_level_no_safety_guarantee")
+        reasons.append("binance_audit_explicit_low_assessment_no_safety_guarantee")
     else:
-        reasons.append("binance_audit_unknown_or_medium_high_risk")
+        reasons.append("binance_audit_unassessed_or_medium_high_or_flagged")
 
     if token.get("symbol_contract_count", 1) > 1:
         score -= 20
@@ -407,8 +426,11 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
         hard_blocks.append("security_caution_or_unknown")
     if risk.get("status") != "ok" or missing_risk:
         hard_blocks.append("security_evidence_incomplete")
-    if not binance_audit.get("available") or binance_audit.get("risk_level") is None or binance_audit.get("risk_level") > 1:
-        hard_blocks.append("binance_audit_unknown_or_medium_high")
+    if (not binance_audit.get("available") or not binance_audit.get("risk_assessment_confirmed")
+            or binance_audit.get("risk_level_enum") != "LOW"
+            or binance_audit.get("risk_level") is None or binance_audit.get("risk_level") > 1
+            or binance_audit.get("hard_risk_hits")):
+        hard_blocks.append("binance_audit_unassessed_medium_high_or_flagged")
     if tax_sources_disagree:
         hard_blocks.append("tax_sources_disagree")
     if token.get("symbol_contract_count", 1) > 1:
@@ -470,8 +492,9 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
             "symbol_contract_count_in_feed": token["symbol_contract_count"],
             "buy_tax_fraction_oracl3": buy_tax,
             "sell_tax_fraction_oracl3": sell_tax,
-            "buy_tax_pct_binance": binance_buy_tax_pct,
-            "sell_tax_pct_binance": binance_sell_tax_pct,
+            "buy_tax_raw_binance": binance_buy_tax_raw,
+            "sell_tax_raw_binance": binance_sell_tax_raw,
+            "binance_tax_unit_semantics_verified": False,
             "tax_sources_disagree": tax_sources_disagree,
             "target_market_cap_if_1000x_usd": target_cap,
         },
