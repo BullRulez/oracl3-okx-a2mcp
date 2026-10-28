@@ -5,6 +5,7 @@ research/shadow classification; a "shadow entry" is not a live order instruction
 """
 import asyncio
 import datetime as dt
+import logging
 import math
 import os
 import re
@@ -16,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Query
 from .risk import summarize
 
 router = APIRouter()
+logger = logging.getLogger("glaw_market_screen")
 EVM_ADDRESS = re.compile(r"^0x[a-fA-F0-9]{40}$")
 TOPIC_RUSH_URL = (
     "https://web3.binance.com/bapi/defi/v2/public/wallet-direct/"
@@ -63,6 +65,8 @@ def _utc_now():
 
 async def _get_json(client, url, params=None, headers=None, timeout=None):
     response = await client.get(url, params=params, headers=headers, timeout=timeout)
+    if response.status_code >= 400:
+        logger.warning("UPSTREAM_HTTP_ERROR host_path=%s status=%s", url.split("?", 1)[0], response.status_code)
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
@@ -609,7 +613,8 @@ async def market_screen(
                 },
             )
             if str(feed.get("code")) != "000000":
-                raise HTTPException(502, "Binance topic feed returned a provider error")
+                logger.warning("BINANCE_TOPIC_FEED_NON_SUCCESS code=%s message=%s", feed.get("code"), feed.get("message"))
+                raise HTTPException(502, f"Binance topic feed provider code {feed.get('code')}")
             candidates, unique_contract_count = _extract_candidates(
                 feed, DEFAULT_MIN_MARKET_CAP, DEFAULT_MAX_MARKET_CAP, DEFAULT_MIN_LIQUIDITY,
             )
@@ -624,14 +629,21 @@ async def market_screen(
                     _token_search_tax(client, chain_id, address),
                     _candles(client, address),
                 )
-                return _evaluate(candidate, dynamic, risk, binance_audit, binance_token_info, candles)
+                try:
+                    return _evaluate(candidate, dynamic, risk, binance_audit, binance_token_info, candles)
+                except Exception:
+                    logger.exception("CANDIDATE_EVALUATION_FAILED address=%s", address)
+                    raise
 
             evaluated = await asyncio.gather(*(inspect(candidate) for candidate in selected))
-    except HTTPException:
+    except HTTPException as exc:
+        logger.warning("MARKET_SCREEN_HTTP_EXCEPTION status=%s detail=%s", exc.status_code, exc.detail)
         raise
     except (httpx.TimeoutException, asyncio.TimeoutError):
+        logger.exception("MARKET_SCREEN_TIMEOUT")
         raise HTTPException(504, "market screen upstream timed out") from None
     except (httpx.HTTPError, ValueError, TypeError):
+        logger.exception("MARKET_SCREEN_UPSTREAM_OR_PROCESSING_FAILURE")
         raise HTTPException(502, "market screen upstream request failed") from None
 
     dispositions = {}
