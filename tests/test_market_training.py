@@ -94,6 +94,13 @@ def _market():
     }
 
 
+def _binance_audit():
+    return {
+        "available": True, "status": "ok", "risk_level": 1, "risk_level_enum": "LOW",
+        "buy_tax_pct": 1, "sell_tax_pct": 1, "verified_contract": True, "risk_items": [],
+    }
+
+
 def _candles():
     return {
         "available": True,
@@ -130,7 +137,7 @@ def test_discovery_deduplicates_contracts_but_tracks_symbol_collisions():
 
 
 def test_complete_evidence_and_reversal_yields_shadow_not_live_trade():
-    result = _evaluate(_candidate(), _market(), RISK_OK, _candles())
+    result = _evaluate(_candidate(), _market(), RISK_OK, _binance_audit(), _candles())
     assert result["disposition"] == "SHADOW_ENTRY_CONDITION_MET"
     assert result["score_is_probability"] is False
     assert result["risk_evidence"]["missing_fields"] == []
@@ -139,7 +146,7 @@ def test_complete_evidence_and_reversal_yields_shadow_not_live_trade():
 def test_symbol_collision_blocks_shadow_entry():
     token = _candidate()
     token["symbol_contract_count"] = 3
-    result = _evaluate(token, _market(), RISK_OK, _candles())
+    result = _evaluate(token, _market(), RISK_OK, _binance_audit(), _candles())
     assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
     assert "ambiguous_duplicate_symbol" in result["hard_blocks"]
 
@@ -152,6 +159,23 @@ def test_incomplete_security_evidence_blocks_shadow_entry():
             "missing_risk_fields": ["cannot_sell_all"],
         },
     }
-    result = _evaluate(_candidate(), _market(), risk, _candles())
+    result = _evaluate(_candidate(), _market(), risk, _binance_audit(), _candles())
     assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
     assert "security_evidence_incomplete" in result["hard_blocks"]
+
+
+def test_unknown_binance_audit_blocks_shadow_entry():
+    result = _evaluate(
+        _candidate(), _market(), RISK_OK,
+        {"available": False, "status": "unknown"},
+        _candles(),
+    )
+    assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
+    assert "binance_audit_unknown_or_medium_high" in result["hard_blocks"]
+
+
+def test_disagreeing_tax_sources_block_shadow_entry():
+    audit = {**_binance_audit(), "buy_tax_pct": 9}
+    result = _evaluate(_candidate(), _market(), RISK_OK, audit, _candles())
+    assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
+    assert "tax_sources_disagree" in result["hard_blocks"]
