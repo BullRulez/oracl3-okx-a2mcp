@@ -96,8 +96,10 @@ def _market():
 
 def _binance_audit():
     return {
-        "available": True, "status": "ok", "risk_level": 1, "risk_level_enum": "LOW",
-        "buy_tax_pct": 1, "sell_tax_pct": 1, "verified_contract": True, "risk_items": [],
+        "available": True, "status": "ok", "risk_assessment_confirmed": True,
+        "risk_level": 1, "risk_level_enum": "LOW",
+        "buy_tax_raw": 0.01, "sell_tax_raw": 0.01,
+        "verified_contract": True, "hard_risk_hits": [], "risk_items": [],
     }
 
 
@@ -175,7 +177,7 @@ def test_unknown_binance_audit_blocks_shadow_entry():
 
 
 def test_disagreeing_tax_sources_block_shadow_entry():
-    audit = {**_binance_audit(), "buy_tax_pct": 9}
+    audit = {**_binance_audit(), "buy_tax_raw": 0.09}
     result = _evaluate(_candidate(), _market(), RISK_OK, audit, _candles())
     assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
     assert "tax_sources_disagree" in result["hard_blocks"]
