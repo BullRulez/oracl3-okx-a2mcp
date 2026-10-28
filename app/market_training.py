@@ -1,4 +1,4 @@
-"""Read-only market discovery and low/high reversal screen for GLaw training.
+"""Read-only market discovery and multi-timeframe TA for GLOR3 training.
 
 This module never signs, swaps, transfers, or sends transactions. Every result is a
 research/shadow classification; a "shadow entry" is not a live order instruction.
@@ -17,7 +17,7 @@ from fastapi import APIRouter, HTTPException, Query
 from .risk import summarize
 
 router = APIRouter()
-logger = logging.getLogger("glaw_market_screen")
+logger = logging.getLogger("glor3_market_screen")
 EVM_ADDRESS = re.compile(r"^0x[a-fA-F0-9]{40}$")
 TOPIC_RUSH_URL = (
     "https://web3.binance.com/bapi/defi/v2/public/wallet-direct/"
@@ -88,32 +88,58 @@ async def _dynamic(client, chain_id, address):
 
 
 async def _candles(client, address, interval="1h", limit=8):
-    try:
-        payload = await _get_json(
-            client, KLINE_URL,
-            params={"platform": "bsc", "address": address, "interval": interval, "limit": limit},
-        )
-        candles = payload.get("data")
-        if not isinstance(candles, list):
-            return {"available": False, "error": "candle_data_unavailable"}
-        normalized = []
-        for candle in candles:
-            if not isinstance(candle, list) or len(candle) < 7:
+    """Read candle bars with one bounded retry; preserve unavailable vs empty data."""
+    last_error = "candle_data_unavailable"
+    for attempt in range(2):
+        try:
+            payload = await _get_json(
+                client, KLINE_URL,
+                params={"platform": "bsc", "address": address, "interval": interval, "limit": limit},
+                timeout=httpx.Timeout(15.0, connect=5.0),
+            )
+            status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+            provider_error = str(status.get("error_code") or "0") not in {"0", "000000"}
+            if provider_error:
+                last_error = "candle_provider_error"
+                if attempt == 0:
+                    continue
+                return {"available": False, "candles": [], "error": last_error,
+                        "source_timestamp": status.get("timestamp")}
+            candles = payload.get("data")
+            if not isinstance(candles, list) or not candles:
+                last_error = "candle_data_empty_or_invalid"
+                if attempt == 0:
+                    continue
+                return {"available": False, "candles": [], "error": last_error,
+                        "source_timestamp": status.get("timestamp")}
+            normalized = []
+            for candle in candles:
+                if not isinstance(candle, list) or len(candle) < 7:
+                    continue
+                values = [_number(candle[i]) for i in range(6)]
+                if any(v is None for v in values):
+                    continue
+                normalized.append({
+                    "open": values[0], "high": values[1], "low": values[2],
+                    "close": values[3], "volume": values[4],
+                    "timestamp_ms": int(values[5]), "trades": int(candle[6]),
+                })
+            if not normalized:
+                last_error = "candle_rows_failed_validation"
+                if attempt == 0:
+                    continue
+                return {"available": False, "candles": [], "error": last_error,
+                        "source_timestamp": status.get("timestamp")}
+            return {
+                "available": True, "candles": normalized,
+                "source_timestamp": status.get("timestamp"),
+                "source_error": None,
+            }
+        except (httpx.HTTPError, ValueError, TypeError):
+            last_error = "candle_data_request_failed"
+            if attempt == 0:
                 continue
-            values = [_number(candle[i]) for i in range(6)]
-            if any(v is None for v in values):
-                continue
-            normalized.append({
-                "open": values[0], "high": values[1], "low": values[2],
-                "close": values[3], "volume": values[4],
-                "timestamp_ms": int(values[5]), "trades": int(candle[6]),
-            })
-        return {
-            "available": True, "candles": normalized,
-            "source_timestamp": (payload.get("status") or {}).get("timestamp"),
-        }
-    except (httpx.HTTPError, ValueError, TypeError):
-        return {"available": False, "error": "candle_data_request_failed"}
+    return {"available": False, "candles": [], "error": last_error, "source_timestamp": None}
 
 
 _INTERVAL_MS = {
@@ -306,6 +332,9 @@ def _technical_frame(candle_result, interval, now_ms=None):
 
     return {
         "timeframe": interval,
+        "source_available": bool(candle_result.get("available")),
+        "source_error": candle_result.get("error"),
+        "source_timestamp": candle_result.get("source_timestamp"),
         "candles_returned": len(raw),
         "closed_candles_used": len(closed),
         "required_for_full_indicator_set": 60,
@@ -853,7 +882,7 @@ async def market_screen(
     retrieved_at = _utc_now()
     headers = {
         "accept": "application/json",
-        "User-Agent": "AMX-GLaw-Market-Screen/0.1",
+        "User-Agent": "AMX-GLOR3-Market-Screen/0.2",
     }
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=4.0),
@@ -907,7 +936,7 @@ async def market_screen(
     target_value = start_amount_usd * target_multiple
     return {
         "status": "read_only_screen_complete",
-        "service": "ORACL3 / GLaw Market Training Candidate",
+        "service": "ORACL3 / GLOR3 Market Training Candidate",
         "retrieved_at_utc": retrieved_at,
         "chain_id": chain_id,
         "source": "Binance Web3 rising-topic feed + market dynamic + candles + Binance token-audit; existing ORACL3 normalized risk preflight",
@@ -984,12 +1013,20 @@ async def technical_analysis(
     higher_bullish = sum(frames[interval]["technical_bias"] == "BULLISH" for interval in ("4h", "1d"))
     higher_bearish = sum(frames[interval]["technical_bias"] == "BEARISH" for interval in ("4h", "1d"))
 
+    higher_context_incomplete = any(
+        frames[interval]["stale"] or frames[interval]["technical_bias"] == "INSUFFICIENT_DATA"
+        for interval in ("4h", "1d")
+    )
     if missing_or_stale > 0:
         overall = "INSUFFICIENT_OR_STALE_DATA"
-    elif core_bullish == 3 and higher_bearish == 0:
+    elif core_bullish == 3 and higher_bearish == 0 and not higher_context_incomplete:
         overall = "MULTI_TIMEFRAME_BULLISH_ALIGNMENT"
-    elif core_bearish == 3 and higher_bullish == 0:
+    elif core_bullish == 3 and higher_bearish == 0 and higher_context_incomplete:
+        overall = "CORE_BULLISH_HIGHER_CONTEXT_INCOMPLETE"
+    elif core_bearish == 3 and higher_bullish == 0 and not higher_context_incomplete:
         overall = "MULTI_TIMEFRAME_BEARISH_ALIGNMENT"
+    elif core_bearish == 3 and higher_bullish == 0 and higher_context_incomplete:
+        overall = "CORE_BEARISH_HIGHER_CONTEXT_INCOMPLETE"
     else:
         overall = "MIXED_OR_CONFLICTING_TIMEFRAMES"
 
@@ -1016,6 +1053,11 @@ async def technical_analysis(
         "core_timeframe_counts": {
             "bullish": core_bullish, "bearish": core_bearish, "missing_or_stale": missing_or_stale,
             "higher_timeframe_bullish": higher_bullish, "higher_timeframe_bearish": higher_bearish,
+            "higher_context_incomplete": higher_context_incomplete,
+            "higher_context_missing_or_stale_intervals": [
+                interval for interval in ("4h", "1d")
+                if frames[interval]["stale"] or frames[interval]["technical_bias"] == "INSUFFICIENT_DATA"
+            ],
         },
         "timeframes": frames,
         "progression_ladder": progression,
