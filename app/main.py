@@ -7,7 +7,7 @@ from fastapi.responses import RedirectResponse
 
 from .risk import summarize
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 UPSTREAM_TOTAL_TIMEOUT_SECONDS = 15.0
 app = FastAPI(title="AMilliMATRiX ORACL3 Token Preflight", version=VERSION)
 
@@ -109,3 +109,7 @@ def configure_x402(app):
     return True
 
 X402_ENABLED = configure_x402(app)
+
+# Branch-only, read-only research endpoint. No wallet or transaction capability.
+from .market_training import router as market_training_router
+app.include_router(market_training_router)
