@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.market_training import _evaluate, _extract_candidates, _technical_frame, _progression_ladder, _ema_series, _normalize_candle_rows
+from app.market_training import _evaluate, _extract_candidates, _technical_frame, _progression_ladder, _ema_series, _normalize_candle_rows, _items_from_payload, _skill_item_summary
 
 client = TestClient(app)
 
@@ -282,3 +282,27 @@ def test_daily_candles_with_null_trade_count_keep_valid_ohlcv():
     assert rows[0]["close"] == 1.1
     assert rows[0]["trades"] is None
     assert rows[1]["trades"] == 15
+
+
+def test_topic_rush_skill_feed_flattens_tokens_and_preserves_topic():
+    items = _items_from_payload("topic-rush", [
+        {
+            "name": {"topicNameEn": "Rising meme narrative"},
+            "tokenList": [
+                {"chainId": "56", "contractAddress": "0x1111111111111111111111111111111111111111", "symbol": "TEST", "marketCap": "10000"},
+            ],
+        },
+    ])
+    assert len(items) == 1
+    assert items[0]["_topic_name"] == "Rising meme narrative"
+    summary = _skill_item_summary(items[0], "56", "topic-rush")
+    assert summary["contract_address"] == "0x1111111111111111111111111111111111111111"
+    assert summary["topic_name"] == "Rising meme narrative"
+    assert summary["buy_tax_raw"] is None
+    assert summary["sell_tax_raw"] is None
+
+
+def test_skill_sweep_rejects_unsupported_chain_without_external_call():
+    response = client.get("/v1/skill-sweep/999")
+    assert response.status_code == 400
+    assert "supported chain_id values" in response.json()["detail"]
