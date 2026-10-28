@@ -173,7 +173,7 @@ def test_unknown_binance_audit_blocks_shadow_entry():
         _candles(),
     )
     assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
-    assert "binance_audit_unknown_or_medium_high" in result["hard_blocks"]
+    assert "binance_audit_unassessed_medium_high_or_flagged" in result["hard_blocks"]
 
 
 def test_disagreeing_tax_sources_block_shadow_entry():
@@ -181,3 +181,21 @@ def test_disagreeing_tax_sources_block_shadow_entry():
     result = _evaluate(_candidate(), _market(), RISK_OK, audit, _candles())
     assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
     assert "tax_sources_disagree" in result["hard_blocks"]
+
+
+def test_zero_risk_level_without_enum_is_unassessed_and_blocked():
+    audit = {
+        "available": True, "status": "unassessed", "risk_assessment_confirmed": False,
+        "risk_level": 0, "risk_level_enum": None,
+        "buy_tax_raw": 0.01, "sell_tax_raw": 0.01, "hard_risk_hits": [],
+    }
+    result = _evaluate(_candidate(), _market(), RISK_OK, audit, _candles())
+    assert result["disposition"] == "REJECT_FROM_SHADOW_ENTRY"
+    assert "binance_audit_unassessed_medium_high_or_flagged" in result["hard_blocks"]
+
+
+def test_tax_units_are_only_cross_checked_per_contract():
+    audit = _binance_audit()
+    result = _evaluate(_candidate(), _market(), RISK_OK, audit, _candles())
+    assert result["market"]["tax_cross_check"]["per_contract_low_tax_cross_check_pass"] is True
+    assert result["market"]["tax_cross_check"]["numerically_agree_within_0_002"] is True
