@@ -318,7 +318,7 @@ def _extract_candidates(payload, min_cap, max_cap, min_liquidity):
     return candidates, len(deduped)
 
 
-def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
+def _evaluate(token, dynamic_result, risk, binance_audit, binance_token_info, candle_result):
     market = dynamic_result.get("data") if dynamic_result.get("available") else {}
     market = market if isinstance(market, dict) else {}
     risk = risk if isinstance(risk, dict) else {"status": "insufficient_evidence", "risk": "unknown"}
