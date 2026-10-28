@@ -10,7 +10,7 @@ client = TestClient(app)
 def test_health_contract():
     r = client.get('/health')
     assert r.status_code == 200
-    assert r.json() == {'status':'ok','service':'ORACL3 Token Preflight','version':'0.1.1','x402_enabled':False}
+    assert r.json() == {'status':'ok','service':'ORACL3 Token Preflight','version':'0.2.0','x402_enabled':False}
 
 def test_root_opens_existing_api_docs():
     r = client.get('/', follow_redirects=False)
