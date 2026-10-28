@@ -8,6 +8,7 @@ import datetime as dt
 import math
 import os
 import re
+import uuid
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -20,6 +21,7 @@ TOPIC_RUSH_URL = (
     "https://web3.binance.com/bapi/defi/v2/public/wallet-direct/"
     "buw/wallet/market/token/social-rush/rank/list/ai"
 )
+BINANCE_AUDIT_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/security/token/audit"
 DYNAMIC_URL = (
     "https://web3.binance.com/bapi/defi/v4/public/wallet-direct/"
     "buw/wallet/market/token/dynamic/info/ai"
@@ -130,6 +132,60 @@ async def _risk(client, chain_id, address):
         }
 
 
+async def _binance_audit(client, chain_id, address):
+    """Independent read-only Binance token audit; never submits a wallet action."""
+    try:
+        response = await client.post(
+            BINANCE_AUDIT_URL,
+            json={
+                "binanceChainId": chain_id,
+                "contractAddress": address,
+                "requestId": str(uuid.uuid4()),
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Accept-Encoding": "identity",
+                "User-Agent": "binance-web3/1.4 (Skill)",
+                "source": "agent",
+            },
+            timeout=httpx.Timeout(10.0, connect=4.0),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict) or str(payload.get("code")) != "000000"
+                or not isinstance(data, dict) or data.get("hasResult") is not True
+                or data.get("isSupported") is not True):
+            return {"available": False, "status": "unknown", "reason": "binance_audit_data_unavailable"}
+        extra = data.get("extraInfo") if isinstance(data.get("extraInfo"), dict) else {}
+        risk_items = data.get("riskItems") if isinstance(data.get("riskItems"), list) else []
+        details = []
+        for item in risk_items:
+            if not isinstance(item, dict):
+                continue
+            for detail in item.get("details") or []:
+                if isinstance(detail, dict):
+                    details.append({
+                        "category": item.get("id"),
+                        "title": detail.get("title"),
+                        "risk_type": detail.get("riskType"),
+                        "is_hit": detail.get("isHit"),
+                    })
+        level = _number(data.get("riskLevel"))
+        return {
+            "available": True,
+            "status": "ok",
+            "risk_level": int(level) if level is not None else None,
+            "risk_level_enum": data.get("riskLevelEnum"),
+            "buy_tax_pct": _number(extra.get("buyTax")),
+            "sell_tax_pct": _number(extra.get("sellTax")),
+            "verified_contract": extra.get("isVerified"),
+            "risk_items": details,
+        }
+    except (httpx.HTTPError, ValueError, TypeError):
+        return {"available": False, "status": "unknown", "reason": "binance_audit_request_failed"}
+
+
 def _extract_candidates(payload, min_cap, max_cap, min_liquidity):
     topics = payload.get("data")
     if not isinstance(topics, list):
@@ -204,10 +260,11 @@ def _extract_candidates(payload, min_cap, max_cap, min_liquidity):
     return candidates, len(deduped)
 
 
-def _evaluate(token, dynamic_result, risk, candle_result):
+def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
     market = dynamic_result.get("data") if dynamic_result.get("available") else {}
     market = market if isinstance(market, dict) else {}
     risk = risk if isinstance(risk, dict) else {"status": "insufficient_evidence", "risk": "unknown"}
+    binance_audit = binance_audit if isinstance(binance_audit, dict) else {"available": False, "status": "unknown"}
     evidence = risk.get("evidence") or {}
     coverage = risk.get("evidence_coverage") or {}
     missing_risk = coverage.get("missing_risk_fields") or []
@@ -234,6 +291,15 @@ def _evaluate(token, dynamic_result, risk, candle_result):
         dev_pct = token["dev_holding_pct_feed"]
     buy_tax = _known_tax_fraction(evidence.get("buy_tax"))
     sell_tax = _known_tax_fraction(evidence.get("sell_tax"))
+    binance_buy_tax_pct = _number(binance_audit.get("buy_tax_pct"))
+    binance_sell_tax_pct = _number(binance_audit.get("sell_tax_pct"))
+    binance_buy_tax = binance_buy_tax_pct / 100.0 if binance_buy_tax_pct is not None and 0 <= binance_buy_tax_pct <= 100 else None
+    binance_sell_tax = binance_sell_tax_pct / 100.0 if binance_sell_tax_pct is not None and 0 <= binance_sell_tax_pct <= 100 else None
+    tax_sources_disagree = (
+        buy_tax is not None and binance_buy_tax is not None and abs(buy_tax-binance_buy_tax) > 0.02
+    ) or (
+        sell_tax is not None and binance_sell_tax is not None and abs(sell_tax-binance_sell_tax) > 0.02
+    )
     price = _positive(market.get("price"))
     high_24h = _positive(market.get("priceHigh24h"))
     low_24h = _positive(market.get("priceLow24h"))
@@ -318,11 +384,16 @@ def _evaluate(token, dynamic_result, risk, candle_result):
         reasons.append("security_risk_coverage_incomplete")
     else:
         reasons.append("security_evidence_unknown_or_caution")
-    if buy_tax is not None and sell_tax is not None and max(buy_tax, sell_tax) <= 0.05:
+    if buy_tax is not None and sell_tax is not None and max(buy_tax, sell_tax) <= 0.05 and binance_buy_tax is not None and binance_sell_tax is not None and not tax_sources_disagree:
         score += 5
-        reasons.append("buy_and_sell_tax_known_and_at_most_5pct")
+        reasons.append("both_sources_confirm_buy_and_sell_tax_at_most_5pct")
     else:
-        reasons.append("buy_or_sell_tax_unknown_or_above_5pct")
+        reasons.append("tax_missing_high_or_not_cross_validated")
+    if binance_audit.get("available") and binance_audit.get("risk_level") is not None and binance_audit.get("risk_level") <= 1:
+        score += 10
+        reasons.append("binance_audit_low_level_no_safety_guarantee")
+    else:
+        reasons.append("binance_audit_unknown_or_medium_high_risk")
 
     if token.get("symbol_contract_count", 1) > 1:
         score -= 20
@@ -336,14 +407,20 @@ def _evaluate(token, dynamic_result, risk, candle_result):
         hard_blocks.append("security_caution_or_unknown")
     if risk.get("status") != "ok" or missing_risk:
         hard_blocks.append("security_evidence_incomplete")
+    if not binance_audit.get("available") or binance_audit.get("risk_level") is None or binance_audit.get("risk_level") > 1:
+        hard_blocks.append("binance_audit_unknown_or_medium_high")
+    if tax_sources_disagree:
+        hard_blocks.append("tax_sources_disagree")
     if token.get("symbol_contract_count", 1) > 1:
         hard_blocks.append("ambiguous_duplicate_symbol")
     if top10 is None or top10 > 35:
         hard_blocks.append("holder_concentration_unknown_or_over_35pct")
     if dev_pct is None or dev_pct > 5:
         hard_blocks.append("developer_concentration_unknown_or_over_5pct")
-    if buy_tax is None or sell_tax is None or max(buy_tax, sell_tax) > 0.05:
-        hard_blocks.append("tax_not_verified_under_5pct")
+    if (buy_tax is None or sell_tax is None or max(buy_tax, sell_tax) > 0.05
+            or binance_buy_tax is None or binance_sell_tax is None
+            or max(binance_buy_tax, binance_sell_tax) > 0.05 or tax_sources_disagree):
+        hard_blocks.append("tax_not_cross_verified_under_5pct")
     if market_cap is None or not (5_000 <= market_cap <= 250_000):
         hard_blocks.append("market_cap_outside_research_band")
     if liquidity is None or liquidity < DEFAULT_MIN_LIQUIDITY:
@@ -391,10 +468,14 @@ def _evaluate(token, dynamic_result, risk, candle_result):
             "volume_1h_sell_usd": sell_1h,
             "trades_5m": trades_5m,
             "symbol_contract_count_in_feed": token["symbol_contract_count"],
-            "buy_tax_fraction": buy_tax,
-            "sell_tax_fraction": sell_tax,
+            "buy_tax_fraction_oracl3": buy_tax,
+            "sell_tax_fraction_oracl3": sell_tax,
+            "buy_tax_pct_binance": binance_buy_tax_pct,
+            "sell_tax_pct_binance": binance_sell_tax_pct,
+            "tax_sources_disagree": tax_sources_disagree,
             "target_market_cap_if_1000x_usd": target_cap,
         },
+        "binance_audit": binance_audit,
         "risk_evidence": {
             "status": risk.get("status"),
             "risk": risk.get("risk"),
@@ -450,12 +531,13 @@ async def market_screen(
 
             async def inspect(candidate):
                 address = candidate["contract_address"]
-                dynamic, risk, candles = await asyncio.gather(
+                dynamic, risk, binance_audit, candles = await asyncio.gather(
                     _dynamic(client, chain_id, address),
                     _risk(client, chain_id, address),
+                    _binance_audit(client, chain_id, address),
                     _candles(client, address),
                 )
-                return _evaluate(candidate, dynamic, risk, candles)
+                return _evaluate(candidate, dynamic, risk, binance_audit, candles)
 
             evaluated = await asyncio.gather(*(inspect(candidate) for candidate in selected))
     except HTTPException:
@@ -476,7 +558,7 @@ async def market_screen(
         "service": "ORACL3 / GLaw Market Training Candidate",
         "retrieved_at_utc": retrieved_at,
         "chain_id": chain_id,
-        "source": "Binance Web3 rising-topic feed + market dynamic + candles; existing ORACL3 normalized risk preflight",
+        "source": "Binance Web3 rising-topic feed + market dynamic + candles + Binance token-audit; existing ORACL3 normalized risk preflight",
         "candidate_universe": {
             "topic_count": len(feed.get("data") or []),
             "unique_contracts_scanned": unique_contract_count,
