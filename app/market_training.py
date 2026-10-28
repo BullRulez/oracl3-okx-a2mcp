@@ -25,7 +25,8 @@ DYNAMIC_URL = (
     "buw/wallet/market/token/dynamic/info/ai"
 )
 KLINE_URL = "https://dquery.sintral.io/u-kline/v1/k-line/candles"
-GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
+ORACL3_BASE_URL = os.getenv("ORACL3_BASE_URL", "https://amx-oracl3-token-preflight.onrender.com").rstrip("/")
+RISK_SEMAPHORE = asyncio.Semaphore(2)
 HTTP_TIMEOUT_SECONDS = 8.0
 DEFAULT_MIN_MARKET_CAP = 5_000.0
 DEFAULT_MAX_MARKET_CAP = 250_000.0
@@ -57,8 +58,8 @@ def _utc_now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
-async def _get_json(client, url, params=None, headers=None):
-    response = await client.get(url, params=params, headers=headers)
+async def _get_json(client, url, params=None, headers=None, timeout=None):
+    response = await client.get(url, params=params, headers=headers, timeout=timeout)
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
@@ -109,31 +110,23 @@ async def _candles(client, address):
 
 
 async def _risk(client, chain_id, address):
-    headers = {"accept": "application/json"}
-    token = os.getenv("GOPLUS_BEARER_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    # Reuse the existing Oracle-owned normalized risk endpoint. Do not create a
+    # second GoPlus credential path or silently downgrade missing data to safe.
     try:
-        payload = await _get_json(
-            client, GOPLUS_URL.format(chain_id=chain_id),
-            params={"contract_addresses": address}, headers=headers,
-        )
-        if "code" in payload and str(payload["code"]) != "1":
-            return {
-                "status": "insufficient_evidence", "risk": "unknown", "flags": [],
-                "evidence_coverage": {"observed_risk_fields": [], "missing_risk_fields": []},
-                "reason": "security_provider_error",
-            }
-        result = summarize(payload, address)
-        return result if isinstance(result, dict) else {
-            "status": "insufficient_evidence", "risk": "unknown", "flags": [],
-            "evidence_coverage": {"observed_risk_fields": [], "missing_risk_fields": []},
-        }
+        async with RISK_SEMAPHORE:
+            payload = await _get_json(
+                client,
+                f"{ORACL3_BASE_URL}/v1/token-preflight/{chain_id}/{address}",
+                timeout=httpx.Timeout(15.0, connect=5.0),
+            )
+        if not isinstance(payload, dict):
+            raise ValueError("ORACL3 returned a non-object response")
+        return payload
     except (httpx.HTTPError, ValueError, TypeError):
         return {
             "status": "insufficient_evidence", "risk": "unknown", "flags": [],
             "evidence_coverage": {"observed_risk_fields": [], "missing_risk_fields": []},
-            "reason": "security_provider_request_failed",
+            "reason": "oracle_preflight_unavailable",
         }
 
 
@@ -483,7 +476,7 @@ async def market_screen(
         "service": "ORACL3 / GLaw Market Training Candidate",
         "retrieved_at_utc": retrieved_at,
         "chain_id": chain_id,
-        "source": "Binance Web3 rising-topic feed + market dynamic + candles; GoPlus risk preflight",
+        "source": "Binance Web3 rising-topic feed + market dynamic + candles; existing ORACL3 normalized risk preflight",
         "candidate_universe": {
             "topic_count": len(feed.get("data") or []),
             "unique_contracts_scanned": unique_contract_count,
