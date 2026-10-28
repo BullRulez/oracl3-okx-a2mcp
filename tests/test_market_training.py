@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.market_training import _evaluate, _extract_candidates, _technical_frame, _progression_ladder, _ema_series
+from app.market_training import _evaluate, _extract_candidates, _technical_frame, _progression_ladder, _ema_series, _normalize_candle_rows
 
 client = TestClient(app)
 
@@ -270,3 +270,15 @@ def test_technical_analysis_rejects_unsupported_chain_without_external_call():
     response = client.get("/v1/technical-analysis/1/0x1111111111111111111111111111111111111111")
     assert response.status_code == 400
     assert "supports BSC" in response.json()["detail"]
+
+
+def test_daily_candles_with_null_trade_count_keep_valid_ohlcv():
+    rows = _normalize_candle_rows([
+        [1.0, 1.2, 0.9, 1.1, 1000, 1787961600000, None],
+        [1.1, 1.3, 1.0, 1.2, 1200, 1788048000000, 15],
+        [None, 1.2, 0.9, 1.1, 1000, 1788134400000, 10],
+    ])
+    assert len(rows) == 2
+    assert rows[0]["close"] == 1.1
+    assert rows[0]["trades"] is None
+    assert rows[1]["trades"] == 15
