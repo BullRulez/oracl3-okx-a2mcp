@@ -201,6 +201,6 @@ def test_zero_risk_level_without_enum_is_unassessed_and_blocked():
 
 def test_tax_units_are_only_cross_checked_per_contract():
     audit = _binance_audit()
-    result = _evaluate(_candidate(), _market(), RISK_OK, audit, _candles())
+    result = _evaluate(_candidate(), _market(), RISK_OK, audit, _binance_token_info(), _candles())
     assert result["market"]["tax_cross_check"]["per_contract_low_tax_cross_check_pass"] is True
-    assert result["market"]["tax_cross_check"]["numerically_agree_within_0_002"] is True
+    assert result["market"]["tax_cross_check"]["numerically_agree_within_0_002_after_endpoint_specific_normalization"] is True
