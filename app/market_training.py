@@ -22,6 +22,7 @@ TOPIC_RUSH_URL = (
     "buw/wallet/market/token/social-rush/rank/list/ai"
 )
 BINANCE_AUDIT_URL = "https://web3.binance.com/bapi/defi/v1/public/wallet-direct/security/token/audit"
+TOKEN_SEARCH_URL = "https://web3.binance.com/bapi/defi/v5/public/wallet-direct/buw/wallet/market/token/search/ai"
 DYNAMIC_URL = (
     "https://web3.binance.com/bapi/defi/v4/public/wallet-direct/"
     "buw/wallet/market/token/dynamic/info/ai"
@@ -130,6 +131,47 @@ async def _risk(client, chain_id, address):
             "evidence_coverage": {"observed_risk_fields": [], "missing_risk_fields": []},
             "reason": "oracle_preflight_unavailable",
         }
+
+
+async def _token_search_tax(client, chain_id, address):
+    """Fetch Binance's market-search tax fields by exact contract address."""
+    try:
+        payload = await _get_json(
+            client, TOKEN_SEARCH_URL,
+            params={"keyword": address, "chainIds": chain_id},
+            timeout=httpx.Timeout(10.0, connect=4.0),
+            headers={"User-Agent": "binance-web3/2.0 (Skill)"},
+        )
+        if str(payload.get("code")) != "000000" or not isinstance(payload.get("data"), list):
+            return {"available": False, "reason": "token_search_unavailable"}
+        matches = [
+            item for item in payload["data"]
+            if isinstance(item, dict)
+            and str(item.get("chainId")) == str(chain_id)
+            and str(item.get("contractAddress") or "").lower() == address.lower()
+        ]
+        if len(matches) != 1:
+            return {
+                "available": False,
+                "reason": "exact_contract_search_not_unique",
+                "match_count": len(matches),
+            }
+        item = matches[0]
+        buy_pct = _number(item.get("taxRateBuy"))
+        sell_pct = _number(item.get("taxRateSell"))
+        return {
+            "available": True,
+            "chain_id": str(chain_id),
+            "contract_address": address,
+            "symbol": item.get("symbol"),
+            "name": item.get("name"),
+            "buy_tax_pct": buy_pct,
+            "sell_tax_pct": sell_pct,
+            "risk_level_search": item.get("riskLevel"),
+            "source": "Binance Web3 token search",
+        }
+    except (httpx.HTTPError, ValueError, TypeError):
+        return {"available": False, "reason": "token_search_request_failed"}
 
 
 async def _binance_audit(client, chain_id, address):
@@ -277,6 +319,7 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
     market = market if isinstance(market, dict) else {}
     risk = risk if isinstance(risk, dict) else {"status": "insufficient_evidence", "risk": "unknown"}
     binance_audit = binance_audit if isinstance(binance_audit, dict) else {"available": False, "status": "unknown"}
+    binance_token_info = binance_token_info if isinstance(binance_token_info, dict) else {"available": False}
     evidence = risk.get("evidence") or {}
     coverage = risk.get("evidence_coverage") or {}
     missing_risk = coverage.get("missing_risk_fields") or []
@@ -305,22 +348,28 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
     sell_tax = _known_tax_fraction(evidence.get("sell_tax"))
     binance_buy_tax_raw = _number(binance_audit.get("buy_tax_raw"))
     binance_sell_tax_raw = _number(binance_audit.get("sell_tax_raw"))
-    # Empirical numerical cross-check only. Provider documentation labels the
-    # Binance fields as percentages, but live values can match GoPlus fractions.
-    # Never convert units implicitly. Raw source-unit semantics stay unverified.
-    binance_buy_tax = binance_buy_tax_raw
-    binance_sell_tax = binance_sell_tax_raw
-    tax_sources_disagree = (
-        buy_tax is not None and binance_buy_tax is not None and abs(buy_tax-binance_buy_tax) > 0.002
-    ) or (
-        sell_tax is not None and binance_sell_tax is not None and abs(sell_tax-binance_sell_tax) > 0.002
-    )
+    search_buy_tax_pct = _number(binance_token_info.get("buy_tax_pct"))
+    search_sell_tax_pct = _number(binance_token_info.get("sell_tax_pct"))
+    # Binance token-search taxRate fields use percentage points (e.g. 3 = 3%).
+    # Live audit extraInfo fields numerically match GoPlus fractions (e.g. 0.03 = 3%).
+    # Normalize market-search fields only, and cross-check all values for this exact contract.
+    search_buy_tax_fraction = search_buy_tax_pct / 100.0 if search_buy_tax_pct is not None and 0 <= search_buy_tax_pct <= 100 else None
+    search_sell_tax_fraction = search_sell_tax_pct / 100.0 if search_sell_tax_pct is not None and 0 <= search_sell_tax_pct <= 100 else None
+    tax_values = [buy_tax, sell_tax, binance_buy_tax_raw, binance_sell_tax_raw, search_buy_tax_fraction, search_sell_tax_fraction]
+    tax_source_values_available = all(v is not None and 0 <= v <= 1 for v in tax_values)
+    tax_sources_disagree = False
+    if tax_source_values_available:
+        buy_group = [buy_tax, binance_buy_tax_raw, search_buy_tax_fraction]
+        sell_group = [sell_tax, binance_sell_tax_raw, search_sell_tax_fraction]
+        tax_sources_disagree = (
+            max(buy_group) - min(buy_group) > 0.002
+            or max(sell_group) - min(sell_group) > 0.002
+        )
     tax_unit_semantics_verified = bool(
-        buy_tax is not None and sell_tax is not None
-        and binance_buy_tax is not None and binance_sell_tax is not None
-        and 0 <= buy_tax <= 0.05 and 0 <= sell_tax <= 0.05
-        and 0 <= binance_buy_tax <= 0.05 and 0 <= binance_sell_tax <= 0.05
+        tax_source_values_available
+        and all(v <= 0.05 for v in tax_values)
         and not tax_sources_disagree
+        and binance_token_info.get("available") is True
     )
     price = _positive(market.get("price"))
     high_24h = _positive(market.get("priceHigh24h"))
@@ -500,16 +549,19 @@ def _evaluate(token, dynamic_result, risk, binance_audit, candle_result):
             "tax_cross_check": {
                 "oracl3_buy_tax_fraction": buy_tax,
                 "oracl3_sell_tax_fraction": sell_tax,
-                "binance_buy_tax_raw": binance_buy_tax_raw,
-                "binance_sell_tax_raw": binance_sell_tax_raw,
-                "numerically_agree_within_0_002": not tax_sources_disagree,
+                "binance_audit_buy_tax_raw": binance_buy_tax_raw,
+                "binance_audit_sell_tax_raw": binance_sell_tax_raw,
+                "binance_market_search_buy_tax_pct": search_buy_tax_pct,
+                "binance_market_search_sell_tax_pct": search_sell_tax_pct,
+                "numerically_agree_within_0_002_after_endpoint_specific_normalization": not tax_sources_disagree if tax_source_values_available else False,
                 "per_contract_low_tax_cross_check_pass": tax_unit_semantics_verified,
-                "note": "Raw Binance audit values are not scaled. Numeric alignment is only per-contract evidence; provider documentation and other endpoints may encode tax units differently."
+                "note": "Token search percentage points are divided by 100; audit raw values are retained and cross-checked against ORACL3 fractions, never silently rescaled."
             },
             "tax_sources_disagree": tax_sources_disagree,
             "target_market_cap_if_1000x_usd": target_cap,
         },
         "binance_audit": binance_audit,
+        "binance_token_info": binance_token_info,
         "risk_evidence": {
             "status": risk.get("status"),
             "risk": risk.get("risk"),
@@ -565,13 +617,14 @@ async def market_screen(
 
             async def inspect(candidate):
                 address = candidate["contract_address"]
-                dynamic, risk, binance_audit, candles = await asyncio.gather(
+                dynamic, risk, binance_audit, binance_token_info, candles = await asyncio.gather(
                     _dynamic(client, chain_id, address),
                     _risk(client, chain_id, address),
                     _binance_audit(client, chain_id, address),
+                    _token_search_tax(client, chain_id, address),
                     _candles(client, address),
                 )
-                return _evaluate(candidate, dynamic, risk, binance_audit, candles)
+                return _evaluate(candidate, dynamic, risk, binance_audit, binance_token_info, candles)
 
             evaluated = await asyncio.gather(*(inspect(candidate) for candidate in selected))
     except HTTPException:
